@@ -38,35 +38,27 @@ Visit https://github.com/chrismattmann/tika-python to learn more about it.
     from tika import language
     print(language.from_file('/path/to/file'))
 
-**Use Tika Translate**::
+**Tika-Python Configuration**
 
-   from tika import translate
-   print(translate.from_file('/path/to/file', 'srcLang', 'destLang')
-   # Use auto Language detection feature
-   print(translate.from_file('/path/to/file', 'destLang')
+You can use a custom server configuration file: a JSON file with a ``server`` element since
+Apache Tika 4 (see https://tika.apache.org/docs/4.1.x/ for the format). Configuration is set
+the first time the server is started. To use a configuration file with a parser or detector::
 
-***Tika-Python Configuration***
-You can now use custom configuration files. See https://tika.apache.org/1.18/configuring.html
-for details on writing configuration files. Configuration is set the first time the server is started.
-To use a configuration file with a parser, or detector:
     parsed = parser.from_file('/path/to/file', config_path='/path/to/configfile')
-or:
     detected = detector.from_file('/path/to/file', config_path='/path/to/configfile')
-or:
     detected = detector.from_buffer('some buffered content', config_path='/path/to/configfile')
 
 '''
 
 USAGE = """
-tika.py [-v] [-e] [-o <outputDir>] [--server <TikaServerEndpoint>] [--install <UrlToTikaServerJar>] [--port <portNumber>] <command> <option> <urlOrPathToFile>
+tika.py [-v] [-e] [-o <outputDir>] [--server <TikaServerEndpoint>] [--install <UrlToTikaServerZip>] [--port <portNumber>] <command> <option> <urlOrPathToFile>
 
 tika.py parse all test.pdf test2.pdf                   (write output JSON metadata files for test1.pdf_meta.json and test2.pdf_meta.json)
 tika.py detect type test.pdf                           (returns mime-type as text/plain)
 tika.py language file french.txt                       (returns language e.g., fr as text/plain)
-tika.py translate fr:en french.txt                     (translates the file french.txt from french to english)
 tika.py config mime-types                              (see what mime-types the Tika Server can handle)
 
-A simple python and command-line client for Tika using the standalone Tika server (JAR file).
+A simple python and command-line client for Tika using the standalone Tika server (zip distribution).
 All commands return results in JSON format by default (except text in text/plain).
 
 To parse docs, use:
@@ -79,7 +71,6 @@ Commands:
   parse  = parse the input file and write a JSON doc file.ext_meta.json containing the extracted metadata, text, or both
   detect type = parse the stream and 'detect' the MIME/media type, return in text/plain
   language file = parse the file stream and identify the language of the text, return its 2 character code in text/plain
-  translate src:dest = parse and extract text and then translate the text from source language to destination language
   config = return a JSON doc describing the configuration of the Tika server (i.e. mime-types it
              can handle, or installed detectors or parsers)
 
@@ -91,7 +82,7 @@ Switches:
   --encode, -e           = encode response in UTF-8
   --csv, -c    = report detect output in comma-delimited format
   --server <TikaServerEndpoint>  = use a remote Tika Server at this endpoint, otherwise use local server
-  --install <UrlToTikaServerJar> = download and exec Tika Server (JAR file), starting server on default port 9998
+  --install <UrlToTikaServerZip> = download, unpack and exec the Tika Server distribution, starting server on default port 9998
 
 Example usage as python client:
 -- from tika import runCommand, parse1
@@ -123,11 +114,15 @@ import hashlib
 import io
 import logging
 import platform
+import shutil
 import signal
 import socket
+import subprocess
 import tempfile
+import zipfile
 from os import walk
 from subprocess import STDOUT, Popen
+from urllib.request import url2pathname
 
 import requests
 
@@ -152,25 +147,38 @@ if os.getenv('TIKA_LOG_FILE', 'tika.log'):
 log.setLevel(logging.INFO)
 
 Windows = True if platform.system() == "Windows" else False
-TikaVersion = os.getenv('TIKA_VERSION', '3.3.2')
+TikaVersion = os.getenv('TIKA_VERSION', '4.1.0')
 TikaJarPath = os.getenv('TIKA_PATH', tempfile.gettempdir())
 TikaFilesPath = tempfile.gettempdir()
 TikaServerLogFilePath = log_path
+# Apache Tika 4 ships the runnable server as a zip distribution in the Apache dist area;
+# current releases live on the CDN, every release stays on the archive.
+TikaDistBaseUrl = 'https://dlcdn.apache.org/tika/'
+TikaArchiveBaseUrl = 'https://archive.apache.org/dist/tika/'
 TikaServerJar = os.getenv(
     'TIKA_SERVER_JAR',
-    "http://search.maven.org/remotecontent?filepath=org/apache/tika/tika-server-standard/"+TikaVersion+"/tika-server-standard-"+TikaVersion+".jar")
-TikaJarHashAlgo=os.getenv('TIKA_JAR_HASH_ALGO', 'md5')
+    TikaDistBaseUrl + TikaVersion + '/tika-server-standard-' + TikaVersion + '.zip')
+TikaJarHashAlgo = os.getenv('TIKA_JAR_HASH_ALGO', 'sha512')
+
+
+def _tikaMajorVersion(version):
+    try:
+        return int(str(version).split('.')[0])
+    except ValueError:
+        return None
+
+
+# Tika 4.x needs Java 17; older servers (still usable via TIKA_VERSION/TIKA_SERVER_JAR) ran on 11
+TikaMinJavaVersion = 11 if (_tikaMajorVersion(TikaVersion) or 4) < 4 else 17
 ServerHost = "localhost"
 Port = "9998"
 ServerEndpoint = os.getenv(
     'TIKA_SERVER_ENDPOINT', 'http://' + ServerHost + ':' + Port)
-Translator = os.getenv(
-    'TIKA_TRANSLATOR',
-    "org.apache.tika.language.translate.Lingo24Translator")
 TikaClientOnly = os.getenv('TIKA_CLIENT_ONLY', False)
 TikaServerClasspath = os.getenv('TIKA_SERVER_CLASSPATH', '')
 TikaStartupSleep = float(os.getenv('TIKA_STARTUP_SLEEP', 5))
-TikaStartupMaxRetry = int(os.getenv('TIKA_STARTUP_MAX_RETRY', 3))
+# Tika 4 boots its parse worker pool before reporting "Started"; allow up to ~30 s on slow machines
+TikaStartupMaxRetry = int(os.getenv('TIKA_STARTUP_MAX_RETRY', 6))
 TikaJava = os.getenv("TIKA_JAVA", "java")
 TikaJavaArgs = os.getenv("TIKA_JAVA_ARGS", '')
 
@@ -184,6 +192,25 @@ TikaServerProcess = False
 class TikaException(Exception):
     pass
 
+# Accept header expected by each /tika output path (Tika 4 no longer picks the format from Accept)
+_TikaAcceptTypes = {
+    '/tika': 'text/plain',
+    '/tika/text': 'text/plain',
+    '/tika/md': 'text/plain',
+    '/tika/xml': 'text/xml',
+    '/tika/html': 'text/html',
+    '/tika/json': 'application/json',
+}
+
+class TikaDownloadError(RuntimeError):
+    '''
+    Raised when a download fails. ``status_code`` holds the HTTP status when the
+    server answered, ``None`` for connection level failures.
+    '''
+    def __init__(self, message, status_code=None):
+        super().__init__(message)
+        self.status_code = status_code
+
 def echo2(*s): sys.stderr.write(str('tika.py: %s\n') % str(' ').join(map(str, s)))
 def warn(*s):  echo2('Warn:', *s)
 def die(*s):   warn('Error:',  *s); echo2(USAGE); sys.exit()
@@ -193,7 +220,7 @@ def runCommand(cmd, option, urlOrPaths, port, outDir=None,
                verbose=Verbose, encode=EncodeUtf8):
     '''
     Run the Tika command by calling the Tika server and return results in JSON format (or plain text).
-    :param cmd: a command from set ``{'parse', 'detect', 'language', 'translate', 'config'}``
+    :param cmd: a command from set ``{'parse', 'detect', 'language', 'config'}``
     :param option:
     :param urlOrPaths:
     :param port:
@@ -216,7 +243,8 @@ def runCommand(cmd, option, urlOrPaths, port, outDir=None,
     elif cmd == "language":
         return detectLang(option, urlOrPaths, serverEndpoint, verbose, tikaServerJar)
     elif cmd == "translate":
-        return doTranslate(option, urlOrPaths, serverEndpoint, verbose, tikaServerJar)
+        log.error('The translate command was removed: Apache Tika 4 no longer offers /translate endpoints.')
+        raise TikaException('translate was removed with Apache Tika 4; use tika-python 3.x against a Tika 3 server')
     elif cmd == "config":
         status, resp = getConfig(option, serverEndpoint, verbose, tikaServerJar)
         return resp
@@ -247,7 +275,7 @@ def getPaths(urlOrPaths):
 
 def parseAndSave(option, urlOrPaths, outDir=None, serverEndpoint=ServerEndpoint, verbose=Verbose, tikaServerJar=TikaServerJar,
                  responseMimeType='application/json', metaExtension='_meta.json',
-                 services={'meta': '/meta', 'text': '/tika', 'all': '/rmeta'}):
+                 services={'meta': '/meta', 'text': '/tika/text', 'all': '/rmeta/xml'}):
     '''
     Parse the objects and write extracted metadata and/or text in JSON format to matching
     filename with an extension of '_meta.json'.
@@ -279,7 +307,7 @@ def parseAndSave(option, urlOrPaths, outDir=None, serverEndpoint=ServerEndpoint,
 
 def parse(option, urlOrPaths, serverEndpoint=ServerEndpoint, verbose=Verbose, tikaServerJar=TikaServerJar,
           responseMimeType='application/json',
-          services={'meta': '/meta', 'text': '/tika', 'all': '/rmeta'}, rawResponse=False):
+          services={'meta': '/meta', 'text': '/tika/text', 'all': '/rmeta/xml'}, rawResponse=False):
     '''
     Parse the objects and return extracted metadata and/or text in JSON format.
     :param option:
@@ -296,7 +324,7 @@ def parse(option, urlOrPaths, serverEndpoint=ServerEndpoint, verbose=Verbose, ti
 
 def parse1(option, urlOrPath, serverEndpoint=ServerEndpoint, verbose=Verbose, tikaServerJar=TikaServerJar,
           responseMimeType='application/json',
-          services={'meta': '/meta', 'text': '/tika', 'all': '/rmeta/text'}, rawResponse=False, headers=None, config_path=None, requestOptions={}):
+          services={'meta': '/meta', 'text': '/tika/text', 'all': '/rmeta/text'}, rawResponse=False, headers=None, config_path=None, requestOptions={}):
     '''
     Parse the object and return extracted metadata and/or text in JSON format.
     :param option:
@@ -313,13 +341,13 @@ def parse1(option, urlOrPath, serverEndpoint=ServerEndpoint, verbose=Verbose, ti
     headers = headers or {}
 
     path, file_type = getRemoteFile(urlOrPath, TikaFilesPath)
-    headers.update({'Accept': responseMimeType, 'Content-Disposition': make_content_disposition_header(path.encode('utf-8') if type(path) is str else path)})
 
     if option not in services:
         log.warning('config option must be one of meta, text, or all; using all.')
     service = services.get(option, services['all'])
-    if service == '/tika': responseMimeType = 'text/plain'
-    headers.update({'Accept': responseMimeType, 'Content-Disposition': make_content_disposition_header(path.encode('utf-8') if type(path) is str else path)})
+    # Tika 4 selects the output format by path, not by Accept, and rejects a mismatching Accept with 406
+    responseMimeType = _TikaAcceptTypes.get(service, responseMimeType)
+    headers.update({'Accept': responseMimeType, 'Content-Disposition': make_content_disposition_header(path)})
     with urlOrPath if _is_file_object(urlOrPath) else open(path, 'rb') as f:
         status, response = callServer('put', serverEndpoint, service, f,
                                       headers, verbose, tikaServerJar, config_path=config_path,
@@ -330,7 +358,7 @@ def parse1(option, urlOrPath, serverEndpoint=ServerEndpoint, verbose=Verbose, ti
 
 def detectLang(option, urlOrPaths, serverEndpoint=ServerEndpoint, verbose=Verbose, tikaServerJar=TikaServerJar,
                 responseMimeType='text/plain',
-                services={'file' : '/language/stream'}):
+                services={'file' : '/language'}):
     '''
     Detect the language of the provided stream and return its 2 character code as text/plain.
     :param option:
@@ -348,9 +376,11 @@ def detectLang(option, urlOrPaths, serverEndpoint=ServerEndpoint, verbose=Verbos
 
 def detectLang1(option, urlOrPath, serverEndpoint=ServerEndpoint, verbose=Verbose, tikaServerJar=TikaServerJar,
                responseMimeType='text/plain',
-               services={'file' : '/language/stream'}, requestOptions={}):
+               services={'file' : '/language'}, requestOptions={}):
     '''
-    Detect the language of the provided stream and return its 2 character code as text/plain.
+    Detect the language of the provided document and return its 2 character code as text/plain.
+    Since Tika 4 the /language endpoint expects text rather than a document, so the text is
+    extracted first (via /tika/text) and then submitted for detection.
     :param option:
     :param urlOrPath:
     :param serverEndpoint:
@@ -360,73 +390,20 @@ def detectLang1(option, urlOrPath, serverEndpoint=ServerEndpoint, verbose=Verbos
     :param services:
     :return:
     '''
-    path, mode = getRemoteFile(urlOrPath, TikaFilesPath)
     if option not in services:
         log.exception('Language option must be one of %s ' % bytes(services.keys()))
         raise TikaException('Language option must be one of %s ' % bytes(services.keys()))
     service = services[option]
-    status, response = callServer('put', serverEndpoint, service, open(path, 'rb'),
+    status, text = parse1('text', urlOrPath, serverEndpoint, verbose, tikaServerJar, requestOptions=requestOptions)
+    if status != 200 or not text:
+        return (status, text)
+    status, response = callServer('put', serverEndpoint, service, text,
             {'Accept': responseMimeType}, verbose, tikaServerJar, requestOptions=requestOptions)
-    return (status, response)
-
-def doTranslate(option, urlOrPaths, serverEndpoint=ServerEndpoint, verbose=Verbose, tikaServerJar=TikaServerJar,
-                responseMimeType='text/plain',
-                services={'all': '/translate/all'}):
-    '''
-    Translate the file from source language to destination language.
-    :param option:
-    :param urlOrPaths:
-    :param serverEndpoint:
-    :param verbose:
-    :param tikaServerJar:
-    :param responseMimeType:
-    :param services:
-    :return:
-    '''
-    paths = getPaths(urlOrPaths)
-    return [doTranslate1(option, path, serverEndpoint, verbose, tikaServerJar, responseMimeType, services)
-            for path in paths]
-
-def doTranslate1(option, urlOrPath, serverEndpoint=ServerEndpoint, verbose=Verbose, tikaServerJar=TikaServerJar,
-                 responseMimeType='text/plain',
-                 services={'all': '/translate/all'}, requestOptions={}):
-    '''
-
-    :param option:
-    :param urlOrPath:
-    :param serverEndpoint:
-    :param verbose:
-    :param tikaServerJar:
-    :param responseMimeType:
-    :param services:
-    :return:
-    '''
-    path, mode = getRemoteFile(urlOrPath, TikaFilesPath)
-    srcLang = ""
-    destLang = ""
-
-    if ":" in option:
-        options = option.rsplit(':')
-        srcLang = options[0]
-        destLang = options[1]
-        if len(options) != 2:
-            log.exception('Translate options are specified as srcLang:destLang or as destLang')
-            raise TikaException('Translate options are specified as srcLang:destLang or as destLang')
-    else:
-        destLang = option
-
-    if srcLang != "" and destLang != "":
-        service = services["all"] + "/" + Translator + "/" + srcLang + "/" + destLang
-    else:
-        service = services["all"] + "/" + Translator + "/" + destLang
-    status, response = callServer('put', serverEndpoint, service, open(path, 'rb'),
-                                  {'Accept' : responseMimeType},
-                                  verbose, tikaServerJar, requestOptions=requestOptions)
     return (status, response)
 
 def detectType(option, urlOrPaths, serverEndpoint=ServerEndpoint, verbose=Verbose, tikaServerJar=TikaServerJar,
                responseMimeType='text/plain',
-               services={'type': '/detect/stream'}):
+               services={'type': '/detect'}):
     '''
     Detect the MIME/media type of the stream and return it in text/plain.
     :param option:
@@ -444,7 +421,7 @@ def detectType(option, urlOrPaths, serverEndpoint=ServerEndpoint, verbose=Verbos
 
 def detectType1(option, urlOrPath, serverEndpoint=ServerEndpoint, verbose=Verbose, tikaServerJar=TikaServerJar,
                responseMimeType='text/plain',
-               services={'type': '/detect/stream'}, config_path=None, requestOptions={}):
+               services={'type': '/detect'}, config_path=None, requestOptions={}):
     '''
     Detect the MIME/media type of the stream and return it in text/plain.
     :param option:
@@ -464,7 +441,7 @@ def detectType1(option, urlOrPath, serverEndpoint=ServerEndpoint, verbose=Verbos
     status, response = callServer('put', serverEndpoint, service, open(path, 'rb'),
             {
                 'Accept': responseMimeType,
-                'Content-Disposition': make_content_disposition_header(path.encode('utf-8') if type(path) is str else path)
+                'Content-Disposition': make_content_disposition_header(path)
             },
             verbose, tikaServerJar, config_path=config_path, requestOptions=requestOptions)
     if csvOutput == 1:
@@ -556,7 +533,8 @@ def callServer(verb, serverEndpoint, service, data, headers, verbose=Verbose, ti
 
 def checkTikaServer(scheme="http", serverHost=ServerHost, port=Port, tikaServerJar=TikaServerJar, classpath=None, config_path=None):
     '''
-    Check that tika-server is running.  If not, download JAR file and start it up.
+    Check that tika-server is running.  If not, fetch the server distribution (see
+    ``ensureTikaServerJar``) and start it up.
     :param scheme: e.g. http or https
     :param serverHost:
     :param port:
@@ -569,20 +547,12 @@ def checkTikaServer(scheme="http", serverHost=ServerHost, port=Port, tikaServerJ
     if port is None:
         port = '443' if scheme == 'https' else '80'
 
-    urlp = urlparse(tikaServerJar)
     serverEndpoint = '%s://%s:%s' % (scheme, serverHost, port)
-    jarPath = os.path.join(TikaJarPath, 'tika-server.jar')
     if 'localhost' in serverEndpoint or '127.0.0.1' in serverEndpoint:
         alreadyRunning = checkPortIsOpen(serverHost, port)
 
         if not alreadyRunning:
-            if not os.path.isfile(jarPath) and urlp.scheme != '':
-                getRemoteJar(tikaServerJar, jarPath)
-
-            if not checkJarSig(tikaServerJar, jarPath):
-                os.remove(jarPath)
-                tikaServerJar = getRemoteJar(tikaServerJar, jarPath)
-
+            jarPath = ensureTikaServerJar(tikaServerJar)
             status = startServer(jarPath, TikaJava, TikaJavaArgs, serverHost, port, classpath, config_path)
             if not status:
                 log.error("Failed to receive startup confirmation from startServer.")
@@ -591,22 +561,33 @@ def checkTikaServer(scheme="http", serverHost=ServerHost, port=Port, tikaServerJ
 
 def checkJarSig(tikaServerJar, jarPath):
     '''
-    Checks the signature of Jar
-    :param tikaServerJar:
-    :param jarPath:
-    :return: ``True`` if the signature of the jar matches
+    Verifies a downloaded server archive (or jar) against its ``.<TIKA_JAR_HASH_ALGO>``
+    checksum sidecar. For a remote source the sidecar is downloaded next to ``jarPath``
+    when it is missing. For a local source (plain path or ``file://`` URL) the sidecar is
+    looked up next to the source; when there is none the check is skipped with a warning
+    so that air-gapped installs keep working.
+    :param tikaServerJar: URL or local path the archive came from
+    :param jarPath: local path of the archive to verify
+    :return: ``True`` if the digest matches (or no sidecar is available for a local source)
     '''
     localChecksumPath = '.'.join([jarPath, TikaJarHashAlgo])
     if not os.path.isfile(localChecksumPath):
-        remoteChecksum = '.'.join([tikaServerJar, TikaJarHashAlgo])
-        getRemoteJar(remoteChecksum, localChecksumPath)
-    m = hashlib.new(TikaJarHashAlgo)
-    with open(jarPath, 'rb') as f:
-        binContents = f.read()
-        m.update(binContents)
-        with open(f"{jarPath}.{TikaJarHashAlgo}", "r") as em:
-            existingContents = em.read()
-            return existingContents == m.hexdigest()
+        sourcePath = _localPathFromUrlOrPath(tikaServerJar)
+        if sourcePath is None:
+            remoteChecksum = '.'.join([tikaServerJar, TikaJarHashAlgo])
+            getRemoteJar(remoteChecksum, localChecksumPath)
+        else:
+            localChecksumPath = '.'.join([sourcePath, TikaJarHashAlgo])
+            if not os.path.isfile(localChecksumPath):
+                log.warning('No %s checksum found next to %s; skipping verification.', TikaJarHashAlgo, sourcePath)
+                return True
+    with open(localChecksumPath, 'r') as em:
+        try:
+            expected = _parseChecksumFile(em.read(), TikaJarHashAlgo)
+        except TikaException as e:
+            log.warning('%s: %s', localChecksumPath, e)
+            return False
+    return expected == _fileDigest(jarPath, TikaJarHashAlgo)
 
 
 def startServer(tikaServerJar, java_path = TikaJava, java_args = TikaJavaArgs, serverHost = ServerHost, port = Port, classpath=None, config_path=None):
@@ -651,20 +632,30 @@ def startServer(tikaServerJar, java_path = TikaJava, java_args = TikaJavaArgs, s
         log.error("Unable to create tika-server.log at %s due to permission error." % (TikaServerLogFilePath))
         return False
 
-    # Check that specified java binary is available on path
-    try:
-        _ = Popen(java_path, stdout=open(os.devnull, "w"), stderr=open(os.devnull, "w"))
-    except FileNotFoundError as e:
-        log.error("Unable to run java; is it installed?")
+    # Check that the specified java binary is available and recent enough
+    javaVersion = _javaMajorVersion(java_path)
+    if javaVersion is None:
+        log.error("Unable to run java (%s); is it installed?", java_path)
         return False
+    if javaVersion < TikaMinJavaVersion:
+        log.error("Apache Tika %s needs Java %d or later, found Java %d at %s",
+                  TikaVersion, TikaMinJavaVersion, javaVersion, java_path)
+        return False
+
+    # Tika 4 forks worker JVMs that resolve "java" from PATH; point them at the same runtime
+    env = os.environ.copy()
+    javaDir = os.path.dirname(java_path)
+    if javaDir:
+        env['PATH'] = javaDir + os.pathsep + env.get('PATH', '')
 
     # Run java with jar args
     global TikaServerProcess
+    log.info("Starting Tika server: %s", cmd_string)
     # Patch for Windows support
     if Windows:
-        TikaServerProcess = Popen(cmd_string, stdout=logFile, stderr=STDOUT, shell=True, start_new_session=True)
+        TikaServerProcess = Popen(cmd_string, stdout=logFile, stderr=STDOUT, shell=True, start_new_session=True, env=env)
     else:
-        TikaServerProcess = Popen(cmd_string, stdout=logFile, stderr=STDOUT, shell=True, preexec_fn=os.setsid)
+        TikaServerProcess = Popen(cmd_string, stdout=logFile, stderr=STDOUT, shell=True, preexec_fn=os.setsid, env=env)
 
     # Check logs and retry as configured
     try_count = 0
@@ -682,9 +673,24 @@ def startServer(tikaServerJar, java_path = TikaJava, java_args = TikaJavaArgs, s
 
     if not is_started:
         log.error("Tika startup log message not received after %d tries." % (TikaStartupMaxRetry))
+        _logServerLogTail(tika_log_file_path)
         return False
     else:
         return True
+
+
+def _logServerLogTail(logPath, lines=20):
+    '''
+    Logs the last lines of the server log so a failed startup can be diagnosed without
+    hunting for tika-server.log.
+    '''
+    try:
+        with open(logPath, 'r', errors='replace') as f:
+            tail = f.readlines()[-lines:]
+    except OSError:
+        return
+    if tail:
+        log.error("Last %d lines of %s:\n%s", len(tail), logPath, ''.join(tail).rstrip())
 
 def killServer():
     '''
@@ -746,7 +752,7 @@ def _urlretrieve(
         The filepath where the file was saved.
 
     Raises:
-        requests.RequestException: If the download fails.
+        TikaDownloadError: If the download fails (``status_code`` set for HTTP errors).
         IOError: If there's an issue writing to the file.
     """
     headers = {"user-agent": "tika-python"}
@@ -775,7 +781,8 @@ def _urlretrieve(
         # Clean up partial file on error
         if os.path.exists(filename):
             os.remove(filename)
-        raise RuntimeError(f"Failed to download {url}: {e}") from e
+        status_code = getattr(getattr(e, 'response', None), 'status_code', None)
+        raise TikaDownloadError(f"Failed to download {url}: {e}", status_code) from e
 
 
 def getRemoteFile(urlOrPath, destPath):
@@ -803,18 +810,242 @@ def getRemoteFile(urlOrPath, destPath):
 
 def getRemoteJar(urlOrPath, destPath):
     '''
-    Fetches URL to local path or just return absolute path.
-    :param urlOrPath: remote resource locator
+    Fetches URL to local path or just return the local path.
+    :param urlOrPath: remote resource locator, ``file://`` URL or local path
     :param destPath: Path to store the resource, usually a path on file system
     :return: tuple having (path, 'local'/'remote')
     '''
+    localPath = _localPathFromUrlOrPath(urlOrPath)
+    if localPath is not None:
+        return (localPath, 'local')
+    log.info('Retrieving %s to %s.' % (urlOrPath, destPath))
+    _downloadWithFallback(urlOrPath, destPath)
+    return (destPath, 'remote')
+
+
+def _localPathFromUrlOrPath(urlOrPath):
+    '''
+    Returns the local filesystem path for a plain path or a ``file://`` URL, or ``None``
+    when ``urlOrPath`` points at a remote resource.
+    '''
     urlp = urlparse(urlOrPath)
-    if urlp.scheme == '':
-        return (os.path.abspath(urlOrPath), 'local')
+    if urlp.scheme == 'file':
+        return os.path.abspath(url2pathname(urlp.path))
+    if len(urlp.scheme) <= 1:
+        # no scheme, or a single letter which is a Windows drive such as C:\...
+        return os.path.abspath(urlOrPath)
+    return None
+
+
+def _fallbackDistributionUrl(url):
+    '''
+    Maps a URL on the Apache dist mirrors (which only carry current releases) to the
+    permanent copy on archive.apache.org. Returns ``None`` for any other URL.
+    '''
+    urlp = urlparse(url)
+    if urlp.scheme in ('http', 'https') and urlp.hostname in ('dlcdn.apache.org', 'downloads.apache.org') \
+            and urlp.path.startswith('/tika/'):
+        return TikaArchiveBaseUrl + urlp.path[len('/tika/'):]
+    return None
+
+
+def _downloadWithFallback(url, filename):
+    '''
+    Downloads ``url`` to ``filename``. When an Apache dist mirror no longer carries the
+    requested release (404) the download is retried once from archive.apache.org.
+    '''
+    try:
+        return _urlretrieve(url, filename)
+    except TikaDownloadError as e:
+        fallback = _fallbackDistributionUrl(url)
+        if e.status_code != 404 or fallback is None:
+            raise
+        log.warning('%s not found (404); retrying from %s', url, fallback)
+        return _urlretrieve(fallback, filename)
+
+
+def _parseChecksumFile(text, algo):
+    '''
+    Extracts the hex digest from a checksum sidecar. Accepts a bare digest, the
+    ``<digest>  <filename>`` form and the ``gpg --print-md`` block form.
+    :return: lowercase hex digest
+    '''
+    expected = hashlib.new(algo).digest_size * 2
+    for token in text.split():
+        if len(token) == expected and re.fullmatch(r'[0-9a-fA-F]+', token):
+            return token.lower()
+    # gpg --print-md style: "<filename>: AB12 CD34 ..." possibly wrapped over several lines
+    compact = re.sub(r'[^0-9a-fA-F]', '', text.split(':', 1)[-1])
+    if len(compact) == expected:
+        return compact.lower()
+    raise TikaException('No %s digest found in checksum file' % algo)
+
+
+def _fileDigest(path, algo, chunk_size=1 << 20):
+    '''
+    Hex digest of a file, computed in chunks.
+    '''
+    m = hashlib.new(algo)
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(chunk_size), b''):
+            m.update(chunk)
+    return m.hexdigest()
+
+
+def _findServerJar(installDir):
+    '''
+    Returns the path of the Tika server launcher jar inside an extracted distribution,
+    or ``None`` if ``installDir`` does not hold a complete distribution (jar plus ``lib/``).
+    '''
+    if not os.path.isdir(os.path.join(installDir, 'lib')):
+        return None
+    jars = [n for n in os.listdir(installDir) if n.lower().endswith('.jar')]
+    preferred = sorted(n for n in jars if n.startswith('tika-server-standard-'))
+    if preferred:
+        return os.path.join(installDir, preferred[0])
+    if len(jars) == 1:
+        return os.path.join(installDir, jars[0])
+    return None
+
+
+def _extractServerDistribution(archivePath, installDir):
+    '''
+    Extracts the Tika server zip distribution into ``installDir``. The archive is unpacked
+    into a temporary sibling directory that is renamed into place at the end, so
+    ``installDir`` only ever exists once it is complete.
+    :return: ``installDir``
+    '''
+    installDir = os.path.abspath(installDir)
+    parent = os.path.dirname(installDir)
+    os.makedirs(parent, exist_ok=True)
+    tmpDir = tempfile.mkdtemp(prefix=os.path.basename(installDir) + '.', dir=parent)
+    try:
+        with zipfile.ZipFile(archivePath) as archive:
+            archive.extractall(tmpDir)
+        # tolerate a distribution wrapped in a single top-level directory
+        source = tmpDir
+        entries = os.listdir(tmpDir)
+        if len(entries) == 1 and _findServerJar(os.path.join(tmpDir, entries[0])):
+            source = os.path.join(tmpDir, entries[0])
+        try:
+            os.rename(source, installDir)
+        except OSError:
+            if not _findServerJar(installDir):
+                raise
+            # another process extracted the same distribution first; keep theirs
+    finally:
+        shutil.rmtree(tmpDir, ignore_errors=True)
+    return installDir
+
+
+def _javaMajorVersion(java_path=TikaJava):
+    '''
+    Major version of the given Java runtime (8 for 1.8.x, 17 for 17.x), or ``None`` when
+    the binary cannot be run or its version output cannot be parsed.
+    '''
+    try:
+        proc = subprocess.run([java_path, '-version'], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = re.search(r'version "(\d+)(?:\.(\d+))?', proc.stderr + proc.stdout)
+    if not match:
+        return None
+    major = int(match.group(1))
+    if major == 1 and match.group(2):
+        return int(match.group(2))
+    return major
+
+
+def _jarNeedsLibDir(jarPath):
+    '''
+    ``True`` when the jar's manifest references a ``lib/`` class path, i.e. it is a thin
+    launcher that only runs next to the ``lib/`` directory of its distribution.
+    '''
+    try:
+        with zipfile.ZipFile(jarPath) as jar:
+            manifest = jar.read('META-INF/MANIFEST.MF').decode('utf-8', 'replace')
+    except (OSError, KeyError, zipfile.BadZipFile):
+        return False
+    manifest = manifest.replace('\r\n ', '').replace('\n ', '')  # unwrap continuation lines
+    return bool(re.search(r'^Class-Path:.*\blib/', manifest, re.MULTILINE))
+
+
+def _removeQuietly(*paths):
+    for path in paths:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def ensureTikaServerJar(tikaServerJar=TikaServerJar):
+    '''
+    Makes sure a runnable Tika server is available locally and returns the path of its
+    launcher jar.
+
+    ``tikaServerJar`` is normally the URL of the ``tika-server-standard-<version>.zip``
+    distribution. It may also be a ``file://`` URL or plain path to a local copy of that
+    zip, or a URL/path ending in ``.jar`` for a jar that already sits next to its ``lib/``
+    directory (or a self-contained pre-4.0 jar). Remote downloads are verified against
+    their ``.<TIKA_JAR_HASH_ALGO>`` sidecar; a zip is extracted once into
+    ``<TIKA_PATH>/<zip name without extension>/`` and reused on later runs.
+    :return: path of the server jar to launch
+    '''
+    sourcePath = _localPathFromUrlOrPath(tikaServerJar)
+    name = os.path.basename(sourcePath if sourcePath is not None else urlparse(tikaServerJar).path)
+    if not name:
+        raise TikaException('Cannot determine the file name of the Tika server distribution from %r' % (tikaServerJar,))
+    checksumSuffix = '.' + TikaJarHashAlgo
+
+    if name.lower().endswith('.jar'):
+        if sourcePath is not None:
+            if not os.path.isfile(sourcePath):
+                raise TikaException('Tika server jar %s does not exist' % sourcePath)
+            jarPath = sourcePath
+        else:
+            jarPath = os.path.join(TikaJarPath, name)
+            if not os.path.isfile(jarPath):
+                getRemoteJar(tikaServerJar, jarPath)
+            if not checkJarSig(tikaServerJar, jarPath):
+                log.warning('Checksum mismatch for %s; downloading again.', jarPath)
+                _removeQuietly(jarPath, jarPath + checksumSuffix)
+                getRemoteJar(tikaServerJar, jarPath)
+                if not checkJarSig(tikaServerJar, jarPath):
+                    raise TikaException('Checksum mismatch for %s after re-download' % jarPath)
+        if _jarNeedsLibDir(jarPath) and not os.path.isdir(os.path.join(os.path.dirname(jarPath), 'lib')):
+            log.warning('%s is a thin launcher without a lib/ directory next to it; since Apache Tika 4 '
+                        'the server only runs from inside the unzipped tika-server-standard distribution.', jarPath)
+        return jarPath
+
+    stem = name[:-4] if name.lower().endswith('.zip') else name
+    installDir = os.path.join(TikaJarPath, stem)
+    jarPath = _findServerJar(installDir)
+    if jarPath:
+        return jarPath
+
+    if sourcePath is not None:
+        archivePath = sourcePath
+        if not os.path.isfile(archivePath):
+            raise TikaException('Tika server distribution %s does not exist' % archivePath)
+        if not checkJarSig(tikaServerJar, archivePath):
+            raise TikaException('Checksum mismatch for %s' % archivePath)
     else:
-        log.info('Retrieving %s to %s.' % (urlOrPath, destPath))
-        _urlretrieve(urlOrPath, destPath)
-        return (destPath, 'remote')
+        archivePath = os.path.join(TikaJarPath, name)
+        if not os.path.isfile(archivePath):
+            getRemoteJar(tikaServerJar, archivePath)
+        if not checkJarSig(tikaServerJar, archivePath):
+            log.warning('Checksum mismatch for %s; downloading again.', archivePath)
+            _removeQuietly(archivePath, archivePath + checksumSuffix)
+            getRemoteJar(tikaServerJar, archivePath)
+            if not checkJarSig(tikaServerJar, archivePath):
+                raise TikaException('Checksum mismatch for %s after re-download' % archivePath)
+
+    log.info('Extracting %s to %s.', archivePath, installDir)
+    _extractServerDistribution(archivePath, installDir)
+    jarPath = _findServerJar(installDir)
+    if not jarPath:
+        raise TikaException('No tika-server-standard-*.jar with a lib/ directory found in %s' % installDir)
+    return jarPath
 
 def checkPortIsOpen(remoteServerHost=ServerHost, port = Port):
     '''
